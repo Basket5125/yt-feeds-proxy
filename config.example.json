@@ -1,0 +1,13 @@
+{
+  "port": 8080,
+  "host": "0.0.0.0",
+  "primary_instance": "http://inv.example.org",
+  "primary_instances": [
+    "http://inv.example.org",
+    "http://inv2.example.org"
+  ],
+  "primary_rpm_limit": 5,
+  "instances_list_url": "http://example.org/instances.json",
+  "instances_refresh_secs": 300,
+  "server_host": "example.com:80"
+}

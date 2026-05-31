@@ -1,0 +1,48 @@
+<!-- categories.xml -->
+<?xml version='1.0' encoding='UTF-8'?>
+<app:categories xmlns:app='http://www.w3.org/2007/app' xmlns:atom='http://www.w3.org/2005/Atom' xmlns:yt='http://gdata.youtube.com/schemas/2007'>
+    <atom:category term='Film' label='Film' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Autos' label='Motoryzacja' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Music' label='Muzyka' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Sports' label='Sport' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Games' label='Gry' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Comedy' label='Komedia' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='People' label='Ludzie' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='News' label='Wiadomości' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Entertainment' label='Rozrywka' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Education' label='Edukacja' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+    <atom:category term='Tech' label='Technologia' scheme='http://gdata.youtube.com/schemas/2007/categories.cat'>
+        <yt:assignable/>
+        <yt:browsable/>
+    </atom:category>
+</app:categories>

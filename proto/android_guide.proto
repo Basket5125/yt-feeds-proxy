@@ -1,0 +1,122 @@
+syntax = "proto3";
+package android_guide;
+
+message TextRuns {
+    message TextRun {
+        string text = 1;
+    }
+    repeated TextRun run = 1;
+}
+
+message BrowseNavigation {
+    message BrowseData {
+        string browseId = 2;
+        string params = 3;
+        string canonicalBaseUrl = 4;
+    }
+    repeated BrowseData data = 48687626;
+}
+
+message GuideEntry {
+    repeated BrowseNavigation navigation = 1;
+    string title = 2;
+    repeated TextRuns iconPath = 3;
+    message IconContainer {
+        int32 iconType = 1;
+    }
+    string subtext = 6;
+    repeated IconContainer icon = 7;
+    repeated TextRuns name = 10;
+}
+
+message TrackingData {
+    int64 field1 = 1;
+    int64 field2 = 2;
+    int64 field3 = 3; 
+    message InnerTracking {
+        int64 field1 = 1;
+        fixed32 field2 = 2;
+        fixed32 field3 = 3;
+    }
+    InnerTracking field4 = 4;
+    bytes field25 = 25;
+}
+
+message PivotBarItem {
+    string tabId = 1;
+    message Field2 {
+        TrackingData field2 = 2;
+    }
+    repeated Field2 field2Wrapper = 2;
+    message TabName {
+        string text = 1;
+    }
+    repeated TabName name = 3;
+    message Field4 {
+        message InnerField4 {
+            string field2 = 2;
+        }
+        repeated InnerField4 inner = 75730170;
+    }
+    repeated Field4 field4 = 4;
+    message Field5 {
+        int32 field1 = 1;
+    }
+    Field5 field5 = 5;
+    TrackingData field9 = 9;
+    string pivotKey = 10;
+}
+
+message Root {
+    message Items {
+        message GuideSectionRenderer {
+            message Contents {
+                repeated GuideEntry entry = 50982577;
+            }
+            repeated Contents content = 3;
+            string header = 4;
+        }
+        repeated GuideSectionRenderer guideSection = 46887524;
+    }
+    repeated Items item = 4;
+
+    message PivotBarContainer {
+        message InnerField3 {
+            int32 field1 = 1;
+            int32 field2 = 2;
+            int32 field3 = 3;
+            TrackingData field4 = 4;
+        }
+        InnerField3 field3 = 3;
+        repeated PivotBarItem pivotItems = 117501096;
+        message EmptyFallback {}
+        repeated EmptyFallback fieldEnd = 2;
+    }
+    repeated PivotBarContainer pivotBar = 117866661;
+
+    message Field5 {
+        int32 field1 = 1;
+        int32 field2 = 2;
+        TrackingData field4 = 4;
+        bytes field25 = 25;
+        message EmptyFallback {}
+        repeated EmptyFallback fieldEnd = 3;
+    }
+    Field5 field5Data = 5;
+
+    message Field19 {
+        message Inner {
+            message DeepInner {
+                TrackingData field2 = 2;
+                message VeryDeep {
+                    int64 field1 = 1;
+                    int64 field2 = 2;
+                }
+                VeryDeep field22581 = 22581;
+            }
+            DeepInner field138681778 = 138681778;
+        }
+        Inner field1 = 1;
+    }
+    Field19 field19 = 19;
+}

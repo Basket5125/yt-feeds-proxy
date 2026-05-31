@@ -1,0 +1,14 @@
+# Rust build output
+target/
+
+# Local runtime files
+rustypipe_cache.json
+stats.json
+config.json
+
+# Editor temporary files
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
