@@ -34,7 +34,7 @@ A lightweight Rust proxy that exposes YouTube-style Atom feed endpoints using In
 ## Build & run
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Basket5125/yt-feeds-proxy.git
 cd yt-feeds-proxy
 cargo build --release
 ```
@@ -91,9 +91,3 @@ Or use:
 ```bash
 docker-compose up -d
 ```
-
-## Notes
-
-- `rustypipe_cache.json` and `stats.json` are runtime artifacts and should not be tracked.
-- `target/` is the Rust build output directory and should not be committed.
-- This repository uses `prost-build` at build time to generate protobuf support from `proto/`.
