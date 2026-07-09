@@ -9,5 +9,6 @@
   "primary_rpm_limit": 5,
   "instances_list_url": "http://example.org/instances.json",
   "instances_refresh_secs": 300,
-  "server_host": "example.com:80"
+  "server_host": "example.com:80",
+  "youtube_api_key": "YOUR_YOUTUBE_API_KEY",
 }
