@@ -1,4 +1,3 @@
-// src/main.rs
 mod api;
 mod protobuf;
 
@@ -10,7 +9,6 @@ use tower_http::trace::TraceLayer;
 use tower_http::classify::ServerErrorsFailureClass;
 use std::str::FromStr;
 use tracing_subscriber::EnvFilter;
-use crate::api::video_comments;
 use crate::protobuf::browse::handle_browse;
 
 pub static CONFIG: Lazy<Config> = Lazy::new(Config::load);
@@ -18,7 +16,6 @@ pub static CONFIG: Lazy<Config> = Lazy::new(Config::load);
 use axum::{body::Bytes, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use std::fs;
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -32,11 +29,12 @@ pub struct Config {
     pub instances_list_url: String,
     pub instances_refresh_secs: u64,
     pub server_host: String,
+    #[serde(default)]
+    pub youtube_api_key: String,
 }
 
 impl Config {
     fn load() -> Self {
-        // Try to load from config.json
         if let Ok(content) = fs::read_to_string("config.json") {
             if let Ok(mut config) = serde_json::from_str::<Config>(&content) {
                 if config.primary_instances.is_empty() {
@@ -51,8 +49,6 @@ impl Config {
                 return config;
             }
         }
-        
-        // Fallback to default config
         Self::default()
     }
 }
@@ -69,7 +65,7 @@ impl Default for Config {
             instances_list_url: "http://144.31.189.129/notPipe.json".to_string(),
             instances_refresh_secs: 300,
             server_host: "192.168.0.31:80".to_string(),
-            // innertube fields removed — this proxy uses Invidious only
+            youtube_api_key: String::new(),
         }
     }
 }
@@ -106,13 +102,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/feeds/api/standardfeeds/:region/:feed", get(api::standard_feed))
         .route("/feeds/api/videos/:video_id", get(api::video_entry))
         .route("/feeds/api/videos/:video_id/", get(api::video_entry))
+        .route("/feeds/api/video/:video_id", get(api::video_entry))
+        .route("/feeds/api/video/:video_id/", get(api::video_entry))
         .route("/feeds/api/videos", get(api::video_search))
         .route("/feeds/api/users/:username/uploads", get(api::user_uploads))
         .route("/feeds/api/users/:username", get(api::user_profile))
         .route("/feeds/api/users/default/playlists", get(api::user_playlists))
         .route("/feeds/api/playlists/:playlist_id", get(api::playlist_details))
         .route("/feeds/api/videos/:video_id/related", get(api::related_videos))
-        .route("/feeds/api/videos/:video_id/comments", get(video_comments))
+        .route("/feeds/api/videos/:video_id/comments", get(api::video_comments))
         .route("/schemas/2007/categories.cat", get(api::categories))
         .route("/youtube/accounts/registerDevice", get(api::register_device))
         .route("/youtube/accounts/registerDevice", post(api::register_device))
@@ -132,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/get_hd_video", get(api::get_hd_video))
         .route("/admin/stats", get(api::stats))
         .route("/admin/stats.json", get(api::stats))
+        .route("/admin/cache", get(api::cache_stats))
+        .route("/admin/cache/clear", get(api::clear_cache))
         .layer(axum::middleware::from_fn(api::record_request))
         .layer(
             TraceLayer::new_for_http()

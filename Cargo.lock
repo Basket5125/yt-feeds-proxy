@@ -2150,6 +2150,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "lazy_static",
  "once_cell",
  "prost",
  "prost-build",
