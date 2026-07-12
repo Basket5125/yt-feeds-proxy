@@ -5,6 +5,7 @@ target/
 rustypipe_cache.json
 stats.json
 config.json
+Cargo.lock
 
 # Editor temporary files
 *.swp

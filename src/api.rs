@@ -735,6 +735,12 @@ pub async fn video_entry(Path(video_id): Path<String>) -> impl IntoResponse {
     let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("");
     let author = data.get("author").and_then(|v| v.as_str()).unwrap_or("");
     let author_id = data.get("authorId").and_then(|v| v.as_str()).unwrap_or("");
+    let author_thumbnail_url = data.get("authorThumbnails")
+    .and_then(|v| v.as_array())
+    .and_then(|arr| arr.last()) 
+    .and_then(|thumb| thumb.get("url"))
+    .and_then(|url| url.as_str())
+    .unwrap_or("");
     let duration = data.get("lengthSeconds").and_then(|v| v.as_i64()).unwrap_or(0);
     let views = data.get("viewCount").and_then(|v| v.as_i64()).unwrap_or(0);
     let favorite_count = data.get("favoriteCount").and_then(|v| v.as_i64()).unwrap_or(views);
@@ -807,6 +813,7 @@ pub async fn video_entry(Path(video_id): Path<String>) -> impl IntoResponse {
 <name>{author_esc}</name>
 <uri>http://{host}/feeds/api/users/{author_id_esc}</uri>
 <yt:userId>{author_id_esc}</yt:userId>
+<media:thumbnail url='{author_thumbnail_url}'/>
 </author>
 <gd:comments>
 <gd:feedLink href='http://{host}/feeds/api/videos/{video_id}/comments' countHint='{comment_count}'/>
