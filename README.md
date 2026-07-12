@@ -16,7 +16,7 @@ A lightweight Rust proxy that exposes YouTube-style Atom feed endpoints using In
 - User profile and uploads: `/feeds/api/users/:username` and `/feeds/api/users/:username/uploads`
 - Redirects to Invidious embeds: `/embed/:video_id`
 - Admin stats endpoints: `/admin/stats` and `/admin/stats.json`
-- Protobuf-based Invidious browse endpoint: `/youtubei/v1/browse`
+
 
 ## Repository layout
 
@@ -29,7 +29,6 @@ A lightweight Rust proxy that exposes YouTube-style Atom feed endpoints using In
 ## Requirements
 
 - Rust stable 1.70+
-- Optional: `ffmpeg` for HD muxing support
 
 ## Build & run
 
@@ -64,7 +63,8 @@ Copy `config.example.json` to `config.json` and update the values for your envir
   "primary_rpm_limit": 5,
   "instances_list_url": "http://example.org/instances.json",
   "instances_refresh_secs": 300,
-  "server_host": "example.com:80"
+  "server_host": "example.com:80",
+  "youtube_api_key": "YOUR_API_KEY"
 }
 ```
 
