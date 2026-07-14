@@ -2225,7 +2225,6 @@ async fn parse_video_formats(video_id: &str) -> Result<(StreamInfo, StreamInfo)>
 }
 
 fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
-    // Szukamy adaptiveFormats
     let adaptive_formats = data
         .get("adaptiveFormats")
         .and_then(|v| v.as_array())
@@ -2236,13 +2235,15 @@ fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
     }
     
     let mut best_format = None;
-    let mut best_score = 0u64;
+    let mut best_priority = -1i32;
+    let mut best_bitrate = 0u64;
+    let mut best_channels = 0u64;
+    let mut best_sample_rate = 0u64;
     
     for format in adaptive_formats {
-        // Pobieramy mimeType - używamy obu wariantów nazwy
+        // Pobieramy mimeType
         let mime = format
             .get("mimeType")
-            .or_else(|| format.get("mimeType"))
             .or_else(|| format.get("type"))
             .and_then(|v| v.as_str());
         
@@ -2257,7 +2258,10 @@ fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
             None => continue,
         };
         
-        // Pobieramy bitrate - może być string lub number
+        // Sprawdzamy xtags w URL - szukamy acont=original
+        let is_original = url.contains("acont%3Doriginal") || url.contains("acont=original");
+        
+        // Pobieramy bitrate
         let bitrate = format
             .get("bitrate")
             .and_then(|v| {
@@ -2299,81 +2303,78 @@ fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
                 }
             });
         
-        // Obliczamy score dla formatu audio
-        // Preferujemy: AAC/MP4 > Opus > inne
-        let quality_score = if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
-            1000 // AAC/MP4 - najlepsza jakość
-        } else if mime.contains("opus") {
-            800 // Opus - dobra jakość
-        } else if mime.contains("webm") {
-            600 // WebM audio - średnia
-        } else {
-            400 // Inne - najgorsza
-        };
-        
-        // Dodajemy bitrate do score (max 1000)
-        let bitrate_score = (bitrate / 1000).min(1000) as u64;
-        
-        // Dodajemy kanały audio (stereo lepsze niż mono)
+        // Pobieramy kanały audio
         let channels = format
             .get("audioChannels")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let channels_score = (channels * 50).min(100);
         
-        // Łączny score
-        let score = quality_score + bitrate_score + channels_score;
+        // Pobieramy częstotliwość próbkowania
+        let sample_rate = format
+            .get("audioSampleRate")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         
-        // Dodatkowo preferujemy wyższą częstotliwość próbkowania
-        if let Some(sample_rate) = format.get("audioSampleRate").and_then(|v| v.as_u64()) {
-            if sample_rate >= 48000 {
-                // High quality audio
-                let bonus = if score < 2000 { 200 } else { 100 };
-                let score = score + bonus;
-                // Używamy score bez przypisania do zmiennej, tylko do porównania
-                let final_score = score;
-                if final_score > best_score {
-                    best_score = final_score;
-                    best_format = Some(StreamInfo {
-                        url,
-                        mime_type: mime.to_string(),
-                        itag,
-                        content_length,
-                        codecs: extract_codecs(mime),
-                        quality: if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
-                            "high".to_string()
-                        } else if mime.contains("opus") {
-                            "medium".to_string()
-                        } else {
-                            "low".to_string()
-                        },
-                    });
-                }
-                continue;
-            }
+        // Określamy priorytet formatu
+        let mut priority = 0i32;
+        
+        // Sprawdzamy typ audio
+        if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
+            // AAC format
+            priority = if is_original { 10000 } else { 5000 };
+        } else if mime.contains("opus") {
+            // Opus format
+            priority = if is_original { 3000 } else { 1000 };
+        } else if mime.contains("webm") {
+            // WebM audio
+            priority = if is_original { 500 } else { 100 };
+        } else {
+            // Inne formaty
+            priority = if is_original { 50 } else { 10 };
         }
         
-        if score > best_score {
-            best_score = score;
+        // Porównujemy z najlepszym znalezionym formatem
+        let is_better = if priority > best_priority {
+            true
+        } else if priority == best_priority {
+            // W ramach tego samego priorytetu, wybieramy wyższy bitrate
+            if bitrate > best_bitrate {
+                true
+            } else if bitrate == best_bitrate {
+                // Przy równym bitrate, wybieramy więcej kanałów
+                if channels > best_channels {
+                    true
+                } else if channels == best_channels {
+                    // Przy równych kanałach, wybieramy wyższą częstotliwość
+                    sample_rate > best_sample_rate
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        
+        if is_better {
+            best_priority = priority;
+            best_bitrate = bitrate;
+            best_channels = channels;
+            best_sample_rate = sample_rate;
+            
             best_format = Some(StreamInfo {
                 url,
                 mime_type: mime.to_string(),
                 itag,
                 content_length,
                 codecs: extract_codecs(mime),
-                quality: if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
-                    "high".to_string()
-                } else if mime.contains("opus") {
-                    "medium".to_string()
-                } else {
-                    "low".to_string()
-                },
+                quality: determine_quality(mime, bitrate),
             });
         }
     }
     
     best_format.ok_or_else(|| {
-        // Debug - wypisz dostępne formaty
         let available: Vec<String> = adaptive_formats
             .iter()
             .filter_map(|f| f.get("mimeType").or_else(|| f.get("type")).and_then(|v| v.as_str()))
@@ -2382,6 +2383,25 @@ fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
         warn!("Available formats: {:?}", available);
         anyhow::anyhow!("No audio format found")
     })
+}
+
+// Funkcja pomocnicza do określania jakości
+fn determine_quality(mime: &str, bitrate: u64) -> String {
+    if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
+        if bitrate > 128000 {
+            "high".to_string()
+        } else {
+            "medium".to_string()
+        }
+    } else if mime.contains("opus") {
+        if bitrate > 100000 {
+            "medium".to_string()
+        } else {
+            "low".to_string()
+        }
+    } else {
+        "low".to_string()
+    }
 }
 
 fn find_best_video_format(data: &serde_json::Value) -> Result<StreamInfo> {
