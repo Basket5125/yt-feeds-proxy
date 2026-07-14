@@ -22,6 +22,9 @@ use tokio::fs;
 use serde_json::json;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use bytes::Bytes;
+use futures::stream::StreamExt;
+
 
 // ============================================================
 // CACHE SYSTEM
@@ -174,6 +177,63 @@ lazy_static::lazy_static! {
         }
         map
     };
+}
+
+// ============================================================
+// STRUCTURES FOR VIDEO FORMATS
+// ============================================================
+
+#[derive(Debug, Clone)]
+struct StreamInfo {
+    url: String,
+    mime_type: String,
+    itag: u32,
+    content_length: Option<u64>,
+    codecs: String,
+    quality: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct InvidiousVideoFormats {
+    #[serde(rename = "adaptiveFormats")]
+    adaptive_formats: Vec<AdaptiveFormat>,
+    #[serde(rename = "formatStreams")]
+    format_streams: Vec<FormatStream>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AdaptiveFormat {
+    itag: u32,
+    url: String,
+    #[serde(rename = "type")]
+    format_type: String,
+    bitrate: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    #[serde(rename = "qualityLabel")]
+    quality_label: Option<String>,
+    #[serde(rename = "resolution")]
+    resolution: Option<String>,
+    #[serde(rename = "fps")]
+    fps: Option<u32>,
+    #[serde(rename = "clen")]
+    content_length: Option<String>,
+    #[serde(rename = "audioChannels")]
+    audio_channels: Option<u32>,
+    #[serde(rename = "audioSampleRate")]
+    audio_sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct FormatStream {
+    itag: u32,
+    url: String,
+    #[serde(rename = "type")]
+    format_type: String,
+    #[serde(rename = "qualityLabel")]
+    quality_label: Option<String>,
+    #[serde(rename = "resolution")]
+    resolution: Option<String>,
 }
 
 // ============================================================
@@ -812,7 +872,7 @@ pub async fn video_entry(Path(video_id): Path<String>) -> impl IntoResponse {
 <author>
 <name>{author_esc}</name>
 <uri>http://{host}/feeds/api/users/{author_id_esc}</uri>
-<yt:userId>{author_id_esc}</yt:userId>
+<yt:userId></yt:userId>
 <media:thumbnail url='{author_thumbnail_url}'/>
 </author>
 <gd:comments>
@@ -1697,13 +1757,430 @@ pub async fn mobile_blzr_profile(Query(params): Query<HashMap<String, String>>) 
     })).into_response()
 }
 
+// ============================================================
+// VIDEO FORMAT PARSING
+// ============================================================
+
+fn extract_codecs(mime_type: &str) -> String {
+    if let Some(start) = mime_type.find("codecs=\"") {
+        let start = start + 8;
+        if let Some(end) = mime_type[start..].find('"') {
+            return mime_type[start..start + end].to_string();
+        }
+    }
+    "avc1.640028".to_string()
+}
+
+async fn parse_video_formats(video_id: &str) -> Result<(StreamInfo, StreamInfo)> {
+    let client = &*HTTP_CLIENT;
+    
+    // Używamy INSTANCE_MANAGER do pobrania instancji
+    let instance = INSTANCE_MANAGER.pick(client).await;
+    let url = format!("{}/api/v1/videos/{}", instance, video_id);
+    
+    info!("Fetching video formats from: {}", instance);
+    
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0")
+        .header("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Failed to fetch video info: {}", response.status()));
+    }
+    
+    let data: serde_json::Value = response.json().await?;
+    
+    // Debug - sprawdzamy czy są formaty
+    if let Some(adaptive) = data.get("adaptiveFormats") {
+        info!("Found adaptiveFormats: {}", 
+            adaptive.as_array().map(|a| a.len()).unwrap_or(0));
+    } else {
+        warn!("No adaptiveFormats found in response");
+        return Err(anyhow::anyhow!("No adaptiveFormats in response"));
+    }
+    
+    let video_info = find_best_video_format(&data)?;
+    let audio_info = find_best_audio_format(&data)?;
+    
+    info!("Video: itag={}, quality={}", video_info.itag, video_info.quality);
+    info!("Audio: itag={}, quality={}", audio_info.itag, audio_info.quality);
+    
+    Ok((video_info, audio_info))
+}
+
+fn find_best_audio_format(data: &serde_json::Value) -> Result<StreamInfo> {
+    // Szukamy adaptiveFormats
+    let adaptive_formats = data
+        .get("adaptiveFormats")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("No adaptiveFormats found in response"))?;
+    
+    if adaptive_formats.is_empty() {
+        return Err(anyhow::anyhow!("adaptiveFormats array is empty"));
+    }
+    
+    let mut best_format = None;
+    let mut best_score = 0u64;
+    
+    for format in adaptive_formats {
+        // Pobieramy mimeType - używamy obu wariantów nazwy
+        let mime = format
+            .get("mimeType")
+            .or_else(|| format.get("mimeType"))
+            .or_else(|| format.get("type"))
+            .and_then(|v| v.as_str());
+        
+        let mime = match mime {
+            Some(m) if m.contains("audio/") => m,
+            _ => continue,
+        };
+        
+        // Pobieramy URL
+        let url = match format.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        
+        // Pobieramy bitrate - może być string lub number
+        let bitrate = format
+            .get("bitrate")
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<u64>().ok()
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        
+        // Pobieramy itag
+        let itag = format
+            .get("itag")
+            .and_then(|v| {
+                if let Some(n) = v.as_u64() {
+                    Some(n as u32)
+                } else if let Some(s) = v.as_str() {
+                    s.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        
+        // Pobieramy długość
+        let content_length = format
+            .get("clen")
+            .or_else(|| format.get("contentLength"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<u64>().ok()
+                } else if let Some(n) = v.as_u64() {
+                    Some(n)
+                } else {
+                    None
+                }
+            });
+        
+        // Obliczamy score dla formatu audio
+        // Preferujemy: AAC/MP4 > Opus > inne
+        let quality_score = if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
+            1000 // AAC/MP4 - najlepsza jakość
+        } else if mime.contains("opus") {
+            800 // Opus - dobra jakość
+        } else if mime.contains("webm") {
+            600 // WebM audio - średnia
+        } else {
+            400 // Inne - najgorsza
+        };
+        
+        // Dodajemy bitrate do score (max 1000)
+        let bitrate_score = (bitrate / 1000).min(1000) as u64;
+        
+        // Dodajemy kanały audio (stereo lepsze niż mono)
+        let channels = format
+            .get("audioChannels")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let channels_score = (channels * 50).min(100);
+        
+        // Łączny score
+        let score = quality_score + bitrate_score + channels_score;
+        
+        // Dodatkowo preferujemy wyższą częstotliwość próbkowania
+        if let Some(sample_rate) = format.get("audioSampleRate").and_then(|v| v.as_u64()) {
+            if sample_rate >= 48000 {
+                // High quality audio
+                let bonus = if score < 2000 { 200 } else { 100 };
+                let score = score + bonus;
+                // Używamy score bez przypisania do zmiennej, tylko do porównania
+                let final_score = score;
+                if final_score > best_score {
+                    best_score = final_score;
+                    best_format = Some(StreamInfo {
+                        url,
+                        mime_type: mime.to_string(),
+                        itag,
+                        content_length,
+                        codecs: extract_codecs(mime),
+                        quality: if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
+                            "high".to_string()
+                        } else if mime.contains("opus") {
+                            "medium".to_string()
+                        } else {
+                            "low".to_string()
+                        },
+                    });
+                }
+                continue;
+            }
+        }
+        
+        if score > best_score {
+            best_score = score;
+            best_format = Some(StreamInfo {
+                url,
+                mime_type: mime.to_string(),
+                itag,
+                content_length,
+                codecs: extract_codecs(mime),
+                quality: if mime.contains("mp4a") || mime.contains("aac") || mime.contains("mp4") {
+                    "high".to_string()
+                } else if mime.contains("opus") {
+                    "medium".to_string()
+                } else {
+                    "low".to_string()
+                },
+            });
+        }
+    }
+    
+    best_format.ok_or_else(|| {
+        // Debug - wypisz dostępne formaty
+        let available: Vec<String> = adaptive_formats
+            .iter()
+            .filter_map(|f| f.get("mimeType").or_else(|| f.get("type")).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .collect();
+        warn!("Available formats: {:?}", available);
+        anyhow::anyhow!("No audio format found")
+    })
+}
+
+fn find_best_video_format(data: &serde_json::Value) -> Result<StreamInfo> {
+    let adaptive_formats = data
+        .get("adaptiveFormats")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("No adaptiveFormats found"))?;
+    
+    // Priorytet: 720p mp4 > 720p > 480p > 360p
+    let priorities = vec!["720p", "480p", "360p", "240p", "144p"];
+    
+    for priority in priorities {
+        for format in adaptive_formats {
+            // Sprawdzamy czy to video
+            let mime = format
+                .get("mimeType")
+                .or_else(|| format.get("type"))
+                .and_then(|v| v.as_str());
+            
+            if let Some(m) = mime {
+                if !m.contains("video/") {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            
+            let quality_label = format
+                .get("qualityLabel")
+                .or_else(|| format.get("qualityLabel"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            if quality_label.contains(priority) {
+                let url = format
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("No URL"))?
+                    .to_string();
+                
+                let mime_type = mime.unwrap_or("video/mp4").to_string();
+                
+                let itag = format
+                    .get("itag")
+                    .and_then(|v| {
+                        if let Some(n) = v.as_u64() {
+                            Some(n as u32)
+                        } else if let Some(s) = v.as_str() {
+                            s.parse::<u32>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                
+                return Ok(StreamInfo {
+                    url,
+                    mime_type: mime_type.clone(),
+                    itag,
+                    content_length: format.get("clen").and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<u64>().ok()
+                        } else if let Some(n) = v.as_u64() {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    }),
+                    codecs: extract_codecs(&mime_type),
+                    quality: priority.to_string(),
+                });
+            }
+        }
+    }
+    
+    // Fallback - weź pierwszy video format
+    for format in adaptive_formats {
+        let mime = format
+            .get("mimeType")
+            .or_else(|| format.get("type"))
+            .and_then(|v| v.as_str());
+        
+        if let Some(m) = mime {
+            if m.contains("video/") {
+                let url = format
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("No URL"))?
+                    .to_string();
+                
+                return Ok(StreamInfo {
+                    url,
+                    mime_type: m.to_string(),
+                    itag: format.get("itag").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    content_length: format.get("clen").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()),
+                    codecs: extract_codecs(m),
+                    quality: "unknown".to_string(),
+                });
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("No video format found"))
+}
+
+// ============================================================
+// GET HD VIDEO - Z OBSŁUGĄ FFMPEG
+// ============================================================
+
 pub async fn get_hd_video(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
     let Some(video_id) = params.get("id") else {
         return (StatusCode::BAD_REQUEST, "Missing id").into_response();
     };
+    
+    info!("GET_HD_VIDEO: id={}", video_id);
+    
+    // Pobieramy informacje o formatach
+    let (video_info, audio_info) = match parse_video_formats(video_id).await {
+        Ok(formats) => formats,
+        Err(e) => {
+            warn!("Failed to parse video formats: {}", e);
+            return (StatusCode::NOT_FOUND, "Video not found").into_response();
+        }
+    };
+    
+    info!("Selected video: itag={}, quality={}", video_info.itag, video_info.quality);
+    info!("Selected audio: itag={}, quality={}", audio_info.itag, audio_info.quality);
+    
+    // Sprawdzamy czy FFmpeg jest dostępny
+    let ffmpeg_check = tokio::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await;
+    
+    if ffmpeg_check.is_ok() {
+        // Używamy FFmpeg do muxowania
+        match stream_muxed_with_ffmpeg(video_info, audio_info).await {
+            Ok(body) => {
+                let mut response = body.into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    "video/mp4".parse().unwrap(),
+                );
+                response.headers_mut().insert(
+                    header::CONTENT_DISPOSITION,
+                    format!("inline; filename=\"{}.mp4\"", video_id).parse().unwrap(),
+                );
+                return response;
+            }
+            Err(e) => {
+                warn!("FFmpeg muxing failed: {}", e);
+            }
+        }
+    } else {
+        warn!("FFmpeg not found, using fallback");
+    }
+    
+    // Fallback - przekieruj do embed
     let client = &*HTTP_CLIENT;
     let instance = INSTANCE_MANAGER.pick(client).await;
     axum::response::Redirect::temporary(&format!("{}/embed/{}?raw=1", instance, video_id)).into_response()
+}
+
+async fn stream_muxed_with_ffmpeg(
+    video_info: StreamInfo,
+    audio_info: StreamInfo,
+) -> Result<axum::body::Body> {
+    use tokio::process::Command;
+    use tokio_util::io::ReaderStream;
+    
+    // Uruchamiamy FFmpeg do strumieniowego muxowania
+    let mut child = Command::new("ffmpeg")
+        .arg("-i")
+        .arg(&video_info.url)
+        .arg("-i")
+        .arg(&audio_info.url)
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("192k")
+        .arg("-movflags")
+        .arg("frag_keyframe+empty_moov")
+        .arg("-f")
+        .arg("mp4")
+        .arg("-")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start FFmpeg: {}", e))?;
+    
+    let stdout = child.stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get FFmpeg stdout"))?;
+    
+    // Tworzymy strumień z stdout FFmpeg
+    let stream = ReaderStream::new(stdout);
+    let body = axum::body::Body::from_stream(stream);
+    
+    // W tle czekamy na zakończenie procesu
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        if let Ok(status) = status {
+            if !status.success() {
+                warn!("FFmpeg process failed with status: {}", status);
+            }
+        }
+    });
+    
+    Ok(body)
 }
 
 // ============================================================
