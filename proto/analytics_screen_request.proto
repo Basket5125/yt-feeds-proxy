@@ -1,9 +1,0 @@
-syntax = "proto3";
-package android_analytics_screen_request;
-
-message root {
-    message reqParamContents {
-        string channelId = 1001;
-    }
-    repeated reqParamContents contents = 32;
-}
