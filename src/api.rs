@@ -22,8 +22,6 @@ use tokio::fs;
 use serde_json::json;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-use bytes::Bytes;
-use futures::stream::StreamExt;
 
 
 // ============================================================
@@ -1508,31 +1506,187 @@ pub async fn embed_video(Path(video_id): Path<String>) -> impl IntoResponse {
     axum::response::Redirect::temporary(&format!("{}/embed/{}?raw=1", instance, video_id)).into_response()
 }
 
-pub async fn mobile_blzr_home(Query(_params): Query<HashMap<String, String>>) -> Response {
-    let t0 = Instant::now();
-    let client = &*HTTP_CLIENT;
-    let instance = INSTANCE_MANAGER.pick(client).await;
-
-    let mut videos: Vec<InvidiousVideo> = Vec::new();
-    let url = format!("{}/api/v1/trending?region=US", instance);
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(v) = resp.json::<Vec<InvidiousVideo>>().await {
-            videos = v.into_iter().filter(|v| !is_live(v)).collect();
+/// Główna funkcja do pobierania filmów
+async fn fetch_videos_unified(
+    client: &Client,
+    region: &str,
+    category_id: Option<&str>,
+    query: Option<&str>,
+    max_results: i32,
+    page_token: Option<&str>,
+) -> Result<(Vec<InvidiousVideo>, Option<String>)> {
+    // PRIORYTET 1: YouTube API (z cache)
+    if let Some(q) = query {
+        if !q.is_empty() {
+            // Dla wyszukiwania - używamy Invidious (YouTube Search API wymaga płatności)
+            let instance = INSTANCE_MANAGER.pick(client).await;
+            let videos = search_videos_from_invidious(client, &instance, q).await;
+            return Ok((videos, None));
         }
     }
-    if videos.is_empty() {
-        let url = format!("{}/api/v1/popular?region=US", instance);
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(v) = resp.json::<Vec<InvidiousVideo>>().await {
-                videos = v.into_iter().filter(|v| !is_live(v)).collect();
+
+    // PRIORYTET 1: YouTube API dla popularnych/trending
+    let api_key = if !crate::CONFIG.youtube_api_key.is_empty() {
+        crate::CONFIG.youtube_api_key.clone()
+    } else {
+        std::env::var("YOUTUBE_API_KEY").unwrap_or_default()
+    };
+
+    if !api_key.is_empty() {
+        // Sprawdź cache
+        let cache_key = ResponseCache::generate_cache_key(
+            region,
+            category_id,
+            page_token,
+            max_results
+        );
+        
+        if let Some(cached_data) = RESPONSE_CACHE.get(cache_key).await {
+            info!("Unified fetch: using cached YouTube API response");
+            let videos: Vec<InvidiousVideo> = cached_data.items
+                .iter()
+                .map(convert_youtube_to_invidious)
+                .collect();
+            return Ok((videos, cached_data.next_page_token));
+        }
+
+        // Fetch z YouTube API
+        match fetch_popular_videos_from_youtube(client, region, category_id, max_results, page_token).await {
+            Ok(response) => {
+                let videos: Vec<InvidiousVideo> = response.items
+                    .iter()
+                    .map(convert_youtube_to_invidious)
+                    .collect();
+                return Ok((videos, response.next_page_token));
+            }
+            Err(e) => {
+                warn!("YouTube API failed, using Invidious fallback: {}", e);
             }
         }
     }
 
-    let mobile_videos: Vec<serde_json::Value> = videos.iter()
-        .take(18)
-        .map(|video| build_mobile_video_object(video, &instance))
-        .collect();
+    // PRIORYTET 2: Invidious fallback
+    let instance = INSTANCE_MANAGER.pick(client).await;
+    
+    // Próbuj najpierw trending
+    let url = if let Some(cat_id) = category_id {
+        format!("{}/api/v1/trending?region={}&category={}", instance, region, cat_id)
+    } else {
+        format!("{}/api/v1/trending?region={}", instance, region)
+    };
+    
+    if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(v) = resp.json::<Vec<InvidiousVideo>>().await {
+            let videos: Vec<InvidiousVideo> = v.into_iter()
+                .filter(|v| !is_live(v))
+                .collect();
+            if !videos.is_empty() {
+                info!("Unified fetch: using Invidious trending ({} videos)", videos.len());
+                return Ok((videos, None));
+            }
+        }
+    }
+
+    // Ostateczny fallback: popular
+    let url = format!("{}/api/v1/popular?region={}", instance, region);
+    if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(v) = resp.json::<Vec<InvidiousVideo>>().await {
+            let videos: Vec<InvidiousVideo> = v.into_iter()
+                .filter(|v| !is_live(v))
+                .collect();
+            if !videos.is_empty() {
+                info!("Unified fetch: using Invidious popular ({} videos)", videos.len());
+                return Ok((videos, None));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("No data source available"))
+}
+
+async fn build_mobile_video_objects(
+    client: &Client,
+    videos: &[InvidiousVideo],
+) -> Vec<serde_json::Value> {
+    let mut result = Vec::with_capacity(videos.len());
+    for video in videos {
+        let instance = INSTANCE_MANAGER.pick(client).await;
+        result.push(build_mobile_video_object(video, &instance));
+    }
+    result
+}
+
+fn build_mobile_video_object(video: &InvidiousVideo, _instance: &str) -> serde_json::Value {
+    let duration_formatted = format_duration(video.length_seconds);
+    let view_count_formatted = format_view_count(video.view_count);
+        // Stream URL - używamy localnego endpointu
+    let stream_url = format!("/get_video?video_id={}/mp4", video.video_id);
+    
+    // Czas publikacji
+    let time_created = if video.published > 0 {
+        format_time_ago(Some(video.published), Some(&video.published_text))
+    } else if !video.published_text.is_empty() {
+        video.published_text.clone()
+    } else {
+        String::new()
+    };
+    
+    json!({
+        "id": video.video_id,
+        "video_id": video.video_id,
+        "title": video.title,
+        "duration": duration_formatted,
+        "view_count": view_count_formatted,
+        "is_playable": true,
+        "username": video.author,
+        "watch_link": format!("/watch?v={}", video.video_id),
+        "thumbnail_for_list": format!("<img src=\"http://i.ytimg.com/vi/{}/default.jpg\"/>", video.video_id),
+        "stream_url": stream_url,
+        "landscape": true,
+        "stitched_thumbnail_large": {
+            "url": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video.video_id),
+            "width": 160,
+            "height": 120,
+            "posx": 60,
+            "posy": 25
+        },
+        "length": video.length_seconds,
+        "tags": Vec::<String>::new(),
+        "short_description": "loading",
+        "time_created_text": time_created
+    })
+}
+
+/// Wersja dla wyników wyszukiwania z instancją
+fn blzr_from_video_with_instance(video: InvidiousVideo, instance: &str) -> serde_json::Value {
+    build_mobile_video_object(&video, instance)
+}
+
+pub async fn mobile_blzr_home(Query(_params): Query<HashMap<String, String>>) -> Response {
+    let t0 = Instant::now();
+    let client = &*HTTP_CLIENT;
+
+    // UŻYJ ZUNIFIKOWANEGO ŹRÓDŁA DANYCH
+    let (videos, _next_token) = match fetch_videos_unified(
+        client,
+        "US",        // region
+        None,        // brak kategorii
+        None,        // brak query
+        18,          // max_results
+        None,        // page_token
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            warn!("Failed to fetch unified videos for home: {}", e);
+            return (StatusCode::SERVICE_UNAVAILABLE, "Failed to fetch videos").into_response();
+        }
+    };
+
+    // Buduj obiekty mobile - tutaj używamy async
+    let mobile_videos = build_mobile_video_objects(client, &videos).await;
+    
+    // Ogranicz do 18
+    let mobile_videos: Vec<serde_json::Value> = mobile_videos.into_iter().take(18).collect();
 
     let response = serde_json::json!({
         "result": "ok",
@@ -1541,7 +1695,10 @@ pub async fn mobile_blzr_home(Query(_params): Query<HashMap<String, String>>) ->
         }
     });
 
-    info!("mobile_blzr_home: {} items, {}ms", response["content"]["home_videos"].as_array().map(|a| a.len()).unwrap_or(0), t0.elapsed().as_millis());
+    info!("mobile_blzr_home: {} items, {}ms", 
+        response["content"]["home_videos"].as_array().map(|a| a.len()).unwrap_or(0), 
+        t0.elapsed().as_millis()
+    );
     Json(response).into_response()
 }
 
@@ -1554,12 +1711,33 @@ pub async fn mobile_blzr_results(Query(params): Query<SearchParams>) -> Response
         if q.is_empty() {
             return (StatusCode::BAD_REQUEST, "Missing query").into_response();
         }
-        let items = search_videos_from_invidious(client, &instance, q).await;
-        items.into_iter().map(blzr_from_video).collect::<Vec<_>>()
+        
+        // UŻYJ ZUNIFIKOWANEGO ŹRÓDŁA DANYCH
+        let (items, _) = match fetch_videos_unified(
+            client,
+            "US",
+            None,
+            Some(q),
+            20,
+            None,
+        ).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Search failed: {}", e);
+                return (StatusCode::SERVICE_UNAVAILABLE, "Search failed").into_response();
+            }
+        };
+        
+        // Używamy poprawnego formatu
+        items.into_iter()
+            .map(|video| build_mobile_video_object(&video, &instance))
+            .collect::<Vec<_>>()
+        
     } else if let Some(category_name) = params.category.as_deref() {
         if category_name.is_empty() {
             return (StatusCode::BAD_REQUEST, "Missing category").into_response();
         }
+        
         let region_code = params.region.as_deref().unwrap_or("US");
         let category_id = CATEGORY_NAME_TO_ID
             .get(category_name)
@@ -1569,16 +1747,31 @@ pub async fn mobile_blzr_results(Query(params): Query<SearchParams>) -> Response
                     .iter()
                     .find_map(|(name, id)| if name.eq_ignore_ascii_case(category_name) { Some(id.clone()) } else { None })
             });
+        
         let category_id = match category_id {
             Some(id) => id,
             None => return (StatusCode::BAD_REQUEST, "Unknown category").into_response(),
         };
-        let limit = params.max_results.unwrap_or(20).min(50) as i32;
-        let yt_response = match fetch_popular_videos_from_youtube(client, region_code, Some(&category_id), limit, None).await {
-            Ok(resp) => resp,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Search failed").into_response(),
+        
+        let (items, _) = match fetch_videos_unified(
+            client,
+            region_code,
+            Some(&category_id),
+            None,
+            params.max_results.unwrap_or(20).min(50) as i32,
+            None,
+        ).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Category fetch failed: {}", e);
+                return (StatusCode::SERVICE_UNAVAILABLE, "Failed to fetch category").into_response();
+            }
         };
-        yt_response.items.iter().map(convert_youtube_to_invidious).map(blzr_from_video).collect::<Vec<_>>()
+        
+        items.into_iter()
+            .map(|video| build_mobile_video_object(&video, &instance))
+            .collect::<Vec<_>>()
+        
     } else {
         return (StatusCode::BAD_REQUEST, "Missing query or category").into_response();
     };
@@ -1586,7 +1779,8 @@ pub async fn mobile_blzr_results(Query(params): Query<SearchParams>) -> Response
     Json(json!({
         "result": "ok",
         "content": {
-            "videos": videos
+            "videos": videos,
+            "results_count": videos.len().to_string()
         }
     })).into_response()
 }
@@ -1603,12 +1797,25 @@ pub async fn mobile_blzr_watch(Query(params): Query<HashMap<String, String>>) ->
 
     let client = &*HTTP_CLIENT;
     let instance = INSTANCE_MANAGER.pick(client).await;
+    
     let url = format!("{}/api/v1/videos/{}", instance, video_id);
-
+    
     let data = if let Ok(resp) = client.get(&url).send().await {
         resp.json::<serde_json::Value>().await.ok()
     } else {
-        None
+        let fallback_instances = INSTANCE_MANAGER.all_instances(client).await;
+        let mut result = None;
+        for inst in fallback_instances {
+            if inst == instance { continue; }
+            let url = format!("{}/api/v1/videos/{}", inst, video_id);
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    result = Some(json);
+                    break;
+                }
+            }
+        }
+        result
     };
 
     if let Some(data) = data {
@@ -1620,6 +1827,211 @@ pub async fn mobile_blzr_watch(Query(params): Query<HashMap<String, String>>) ->
     } else {
         (StatusCode::NOT_FOUND, "Video not found").into_response()
     }
+}
+
+fn blzr_watch_response(instance: &str, video_id: &str, data: &serde_json::Value) -> serde_json::Value {
+    let host = &crate::CONFIG.server_host;
+    // Podstawowe dane z video
+    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let author = data.get("author").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let _author_id = data.get("authorId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let duration_seconds = data.get("lengthSeconds").and_then(|v| v.as_i64()).unwrap_or(0);
+    let view_count = data.get("viewCount").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+        data.get("viewCountText")
+            .and_then(|v| v.as_str())
+            .map(parse_view_count_text)
+            .unwrap_or(0)
+    });
+    let like_count = data.get("likeCount").and_then(|v| v.as_i64()).unwrap_or(0);
+    let dislike_count = data.get("dislikeCount").and_then(|v| v.as_i64()).unwrap_or(0);
+    let comment_count = data.get("commentCount").and_then(|v| v.as_i64()).unwrap_or(0);
+    let description = data.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let published_ts = parse_invidious_timestamp(data.get("published")).unwrap_or(0);
+    let published_text = data.get("publishedText").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    
+    // Kategoria i tagi
+    let category_name = data.get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("People & Blogs")
+        .to_string();
+    
+    let tags: Vec<serde_json::Value> = data.get("keywords")
+        .and_then(|v| v.as_array())
+        .or_else(|| data.get("tags").and_then(|v| v.as_array()))
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str())
+                .map(|keyword| {
+                    json!({
+                        "url": format!("/results?search_query={}", urlencoding::encode(keyword)),
+                        "keyword": keyword
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    
+    // Avatar użytkownika
+    let user_image_url = data.get("authorThumbnails")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|thumb| thumb.get("url").and_then(|u| u.as_str()))
+        .unwrap_or("/assets/yVXKYrUI8hckCQdyUuOWf5ZJk2keT8WO3TV2b8RYk3RKgjz5Rh8v1UsH7Yz2j_hbDQRk32rZ_rM=s88-c-k-c0x00ffffff-no-rj.png")
+        .to_string();
+    
+    // Formatowanie danych
+    let duration_formatted = format_duration(duration_seconds as i32);
+    let view_count_formatted = format_view_count(view_count);
+    let stream_url = format!("http://{}/get_video?video_id={}", host, video_id);
+    let hq_stream_url = format!("http://{}/get_hd_video?id={}", host, video_id);
+    
+    // Czas utworzenia
+    let time_created = if published_ts > 0 {
+        chrono::DateTime::from_timestamp(published_ts, 0)
+            .map(|dt| dt.format("%b %e, %Y").to_string())
+            .unwrap_or_else(|| published_text.clone())
+    } else if !published_text.is_empty() {
+        published_text.clone()
+    } else {
+        "".to_string()
+    };
+    
+    // Short description (pierwsze 200 znaków)
+    let short_description = if description.len() > 200 {
+        format!("{}...", &description[..200])
+    } else {
+        description.clone()
+    };
+    
+    // Budowanie obiektu video
+    let video_obj = json!({
+        "stitched_thumbnail_large": {
+            "url": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video_id),
+            "width": 160,
+            "height": 120,
+            "posx": 60,
+            "posy": 25
+        },
+        "id": video_id,
+        "video_id": video_id,
+        "stream_url": stream_url,
+        "is_playable": true,
+        "title": title,
+        "username": author,
+        "category_name": category_name,
+        "tags": tags,
+        "full_description": description,
+        "short_description": short_description,
+        "time_created_text": time_created,
+        "view_count": view_count_formatted,
+        "duration": duration_formatted,
+        "user_image_url": user_image_url,
+        "hq_stream_url": hq_stream_url,
+        "like_count": like_count,
+        "dislike_count": dislike_count,
+        "comment_count": comment_count,
+        "length": duration_seconds,
+        "thumbnail": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video_id),
+        "watch_url": format!("http://2009frontend.truehosting.net/watch?id={}", video_id),
+        "embed_url": format!("{}/embed/{}?raw=1", instance.trim_end_matches('/'), video_id),
+    });
+    
+    // Pobieranie powiązanych filmów
+    let related_videos: Vec<serde_json::Value> = data.get("recommendedVideos")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let vid = item.get("videoId").and_then(|v| v.as_str())?;
+                    let title = item.get("title").and_then(|v| v.as_str())?;
+                    let author = item.get("author").and_then(|v| v.as_str()).unwrap_or("");
+                    let length_seconds = item.get("lengthSeconds").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let view_count = item.get("viewCount").and_then(|v| v.as_i64())
+                        .or_else(|| item.get("viewCountText").and_then(|v| v.as_str()).map(parse_view_count_text))
+                        .unwrap_or(0);
+                    
+                    Some(json!({
+                        "id": vid,
+                        "video_id": vid,
+                        "title": title.to_string(),
+                        "duration": format_duration(length_seconds as i32),
+                        "view_count": format_view_count(view_count),
+                        "is_playable": true,
+                        "username": author.to_string(),
+                        "watch_link": format!("/watch?v={}", vid),
+                        "thumbnail_for_list": format!("<img src=\"http://i.ytimg.com/vi/{}/default.jpg\"/>", vid),
+                        "stream_url": format!("/get_video?video_id={}/mp4", vid),
+                        "landscape": true,
+                        "stitched_thumbnail_large": {
+                            "url": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+                            "width": 160,
+                            "height": 120,
+                            "posx": 60,
+                            "posy": 25
+                        },
+                        "length": length_seconds,
+                        "tags": Vec::<String>::new(),
+                        "short_description": "loading",
+                        "time_created_text": ""
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    
+    // Końcowa odpowiedź
+    json!({
+        "video": video_obj,
+        "related_videos": related_videos
+    })
+}
+
+fn blzr_comment(comment: &serde_json::Value) -> serde_json::Value {
+    // Pobieramy autora
+    let author_name = comment.get("author")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    
+    // Pobieramy treść komentarza - uproszczona wersja bez problemów z typami
+    let content = if let Some(text) = comment.get("content").and_then(|v| v.as_str()) {
+        text.to_string()
+    } else if let Some(runs) = comment.get("content").and_then(|v| v.get("runs")).and_then(|r| r.as_array()) {
+        runs.iter()
+            .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+            .collect::<String>()
+    } else if let Some(text) = comment.get("content").and_then(|v| v.get("simpleText")).and_then(|v| v.as_str()) {
+        text.to_string()
+    } else {
+        String::new()
+    };
+    
+    // Pobieramy czas publikacji - uproszczona wersja
+    let time_ago = if let Some(text) = comment.get("publishedText").and_then(|v| v.as_str()) {
+        text.to_string()
+    } else if let Some(ts) = comment.get("published").and_then(|v| v.as_i64()) {
+        format_time_ago_comment(ts)
+    } else {
+        String::new()
+    };
+    
+    // Sprawdź czy komentarz jest edytowany
+    let is_edited = comment.get("isEdited")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    // Dodaj "(edited)" jeśli edytowany
+    let time_ago = if is_edited && !time_ago.is_empty() {
+        format!("{} (edited)", time_ago)
+    } else {
+        time_ago
+    };
+    
+    json!({
+        "author_name": author_name,
+        "comment": content,
+        "time_ago": time_ago
+    })
 }
 
 pub async fn mobile_blzr_view_comment(Query(params): Query<HashMap<String, String>>) -> Response {
@@ -1978,8 +2390,7 @@ fn find_best_video_format(data: &serde_json::Value) -> Result<StreamInfo> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("No adaptiveFormats found"))?;
     
-    // Priorytet: 720p mp4 > 720p > 480p > 360p
-    let priorities = vec!["720p", "480p", "360p", "240p", "144p"];
+    let priorities = vec!["1080p", "720p", "480p", "360p", "240p", "144p"];
     
     for priority in priorities {
         for format in adaptive_formats {
@@ -2422,33 +2833,6 @@ fn extract_comment_content(comment: &serde_json::Value) -> String {
     String::new()
 }
 
-fn build_mobile_video_object(video: &InvidiousVideo, instance: &str) -> serde_json::Value {
-    json!({
-        "id": video.video_id,
-        "video_id": video.video_id,
-        "title": video.title,
-        "duration": format_duration(video.length_seconds),
-        "view_count": format_view_count(video.view_count),
-        "is_playable": true,
-        "username": video.author,
-        "watch_link": format!("/watch?v={}", video.video_id),
-        "thumbnail_for_list": format!("<img src=\"http://i.ytimg.com/vi/{}/default.jpg\"/>", video.video_id),
-        "stream_url": format!("{}/embed/{}?raw=1", instance.trim_end_matches('/'), video.video_id),
-        "landscape": true,
-        "stitched_thumbnail_large": {
-            "url": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video.video_id),
-            "width": 160,
-            "height": 120,
-            "posx": 60,
-            "posy": 25
-        },
-        "length": video.length_seconds,
-        "tags": Vec::<String>::new(),
-        "short_description": "loading",
-        "time_created_text": ""
-    })
-}
-
 fn is_live(v: &InvidiousVideo) -> bool {
     if v.length_seconds == 0 {
         return true;
@@ -2573,23 +2957,6 @@ fn parse_view_count_text(text: &str) -> i64 {
     digits.parse::<f64>().map(|value| (value * multiplier as f64) as i64).unwrap_or(0)
 }
 
-fn blzr_from_video(video: InvidiousVideo) -> serde_json::Value {
-    json!({
-        "videoId": video.video_id,
-        "title": video.title,
-        "author": video.author,
-        "authorId": video.author_id,
-        "durationSeconds": video.length_seconds,
-        "viewCount": video.view_count,
-        "likeCount": video.likes,
-        "dislikeCount": video.dislikes,
-        "commentCount": video.comment_count,
-        "published": if video.published > 0 { timestamp_to_rfc3339(video.published) } else { video.published_text.clone() },
-        "thumbnail": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video.video_id),
-        "watchUrl": format!("http://2009frontend.truehosting.net/watch?id={}", video.video_id)
-    })
-}
-
 fn blzr_from_invidious_item(item: &serde_json::Value) -> Option<serde_json::Value> {
     let video_id = item.get("videoId").and_then(|v| v.as_str())?;
     let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -2624,55 +2991,31 @@ fn blzr_from_invidious_item(item: &serde_json::Value) -> Option<serde_json::Valu
     }))
 }
 
-fn blzr_watch_response(instance: &str, video_id: &str, data: &serde_json::Value) -> serde_json::Value {
-    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let author = data.get("author").and_then(|v| v.as_str()).unwrap_or("");
-    let author_id = data.get("authorId").and_then(|v| v.as_str()).unwrap_or("");
-    let duration_seconds = data.get("lengthSeconds").and_then(|v| v.as_i64()).unwrap_or(0);
-    let view_count = data.get("viewCount").and_then(|v| v.as_i64()).unwrap_or_else(|| {
-        data.get("viewCountText")
-            .and_then(|v| v.as_str())
-            .map(parse_view_count_text)
-            .unwrap_or(0)
-    });
-    let like_count = data.get("likeCount").and_then(|v| v.as_i64()).unwrap_or(0);
-    let dislike_count = data.get("dislikeCount").and_then(|v| v.as_i64()).unwrap_or(0);
-    let comment_count = data.get("commentCount").and_then(|v| v.as_i64()).unwrap_or(0);
-    let description = data.get("description").and_then(|v| v.as_str()).unwrap_or("");
-    let published = parse_invidious_timestamp(data.get("published")).unwrap_or(0);
-    let published_text = data.get("publishedText").and_then(|v| v.as_str()).unwrap_or("");
-
-    json!({
-        "videoId": video_id,
-        "title": title,
-        "author": author,
-        "authorId": author_id,
-        "durationSeconds": duration_seconds,
-        "viewCount": view_count,
-        "likeCount": like_count,
-        "dislikeCount": dislike_count,
-        "commentCount": comment_count,
-        "description": description,
-        "published": if published > 0 { timestamp_to_rfc3339(published) } else { published_text.to_string() },
-        "thumbnail": format!("http://i.ytimg.com/vi/{}/hqdefault.jpg", video_id),
-        "watchUrl": format!("http://2009frontend.truehosting.net/watch?id={}", video_id),
-        "embedUrl": format!("{}/embed/{}?raw=1", instance.trim_end_matches('/'), video_id),
-    })
-}
-
-fn blzr_comment(comment: &serde_json::Value) -> serde_json::Value {
-    let author = comment.get("author").and_then(|v| v.as_str()).unwrap_or("");
-    let author_id = comment.get("authorId").and_then(|v| v.as_str()).unwrap_or("");
-    let content = comment.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let published = parse_invidious_timestamp(comment.get("published")).unwrap_or(0);
-
-    json!({
-        "commentId": comment.get("commentId").and_then(|v| v.as_str()).unwrap_or(""),
-        "author": author,
-        "authorId": author_id,
-        "content": content,
-        "published": if published > 0 { timestamp_to_rfc3339(published) } else { comment.get("publishedText").and_then(|v| v.as_str()).unwrap_or("").to_string() },
-    })
+fn format_time_ago_comment(timestamp: i64) -> String {
+    let now = Utc::now().timestamp();
+    let diff = now.saturating_sub(timestamp);
+    
+    if diff < 60 {
+        return "Just now".to_string();
+    } else if diff < 3600 {
+        let minutes = diff / 60;
+        return format!("{} {} ago", minutes, if minutes == 1 { "minute" } else { "minutes" });
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        return format!("{} {} ago", hours, if hours == 1 { "hour" } else { "hours" });
+    } else if diff < 604800 {
+        let days = diff / 86400;
+        return format!("{} {} ago", days, if days == 1 { "day" } else { "days" });
+    } else if diff < 2592000 {
+        let weeks = diff / 604800;
+        return format!("{} {} ago", weeks, if weeks == 1 { "week" } else { "weeks" });
+    } else if diff < 31536000 {
+        let months = diff / 2592000;
+        return format!("{} {} ago", months, if months == 1 { "month" } else { "months" });
+    } else {
+        let years = diff / 31536000;
+        return format!("{} {} ago", years, if years == 1 { "year" } else { "years" });
+    }
 }
 
 fn timestamp_to_rfc3339(ts: i64) -> String {
